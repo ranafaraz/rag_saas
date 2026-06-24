@@ -1,8 +1,8 @@
 # Multi-Tenant Role-Aware RAG SaaS
 
-An open-source, CPU-first Retrieval-Augmented Generation SaaS platform with tenant isolation, role-aware retrieval, scheduled knowledge ingestion, usage metering, audit logging, and a Next.js admin portal.
+An open-core, CPU-first Retrieval-Augmented Generation SaaS platform with tenant isolation, role-aware retrieval, public integration APIs, scheduled knowledge ingestion, usage metering, audit logging, and a Next.js admin portal.
 
-The repository is structured as a full-stack reference implementation for teams building internal knowledge assistants, customer support copilots, or document-aware AI products where access control and source attribution matter.
+The repository is structured as a full-stack reference implementation for teams embedding governed RAG into their own web apps, mobile apps, CRMs, internal tools, customer support copilots, or document-aware AI products where access control and source attribution matter.
 
 ## Features
 
@@ -11,6 +11,10 @@ The repository is structured as a full-stack reference implementation for teams 
 - FastAPI chat and ingestion service with Celery workers for asynchronous processing and scheduled jobs.
 - Django REST Framework core API with JWT, Keycloak OIDC hooks, Stripe webhook mirrors, and OpenAPI documentation.
 - Next.js portal for tenant administration, billing controls, prompt configuration, source management, and chat.
+- Versioned `/v1` public RAG API for external app, CRM, and backend integrations.
+- Self-serve tenant signup with trial provisioning, default roles, and first integration API key.
+- API-key scopes, expiry, revocation, last-used tracking, and per-minute rate limits.
+- RAG traces and integration job records for quality reporting and support.
 - Qdrant vector storage, PostgreSQL operational storage, MongoDB audit logs, Redis task queues, and Ollama local model support.
 - Local CPU-friendly defaults with a production path for vLLM-compatible OpenAI-style inference and BGE-M3 embeddings.
 
@@ -78,6 +82,35 @@ Open the services:
 - Core API schema/docs: <http://localhost:8000/api/docs>
 - RAG API: <http://localhost:8001>
 - RAG API docs: <http://localhost:8001/docs>
+
+## Public Integration API
+
+Use tenant API keys from trusted server-side code. For mobile and browser-only apps, proxy calls through your backend so full-scope keys are not exposed.
+
+Core onboarding and integration helpers:
+
+- `POST /api/signup/` provisions a tenant, admin user, trial subscription, roles, and first API key.
+- `GET /api/integration/quickstart/` returns integration examples for the signed-in tenant.
+- `POST /api/api-keys/{id}/rotate/` rotates a key and returns the new raw key once.
+- `POST /api/api-keys/{id}/revoke/` revokes a key.
+
+RAG public API:
+
+- `POST /v1/query`
+- `POST /v1/query/stream`
+- `POST /v1/sources`
+- `POST /v1/documents`
+- `GET /v1/jobs/{id}`
+- `GET /v1/usage`
+
+Example:
+
+```bash
+curl -X POST http://localhost:8001/v1/query \
+  -H "Authorization: Bearer sk_your_key" \
+  -H "Content-Type: application/json" \
+  -d '{"query":"What does our refund policy say?"}'
+```
 
 ## Local Development
 
@@ -184,8 +217,8 @@ npm run lint
 - [Implementation Roadmap](docs/implementation-roadmap.md)
 - [Repository Structure](docs/repo-structure.md)
 
-## Open Source
+## Open Core
 
-This project is released under the MIT License. Contributions, forks, and adaptation for commercial or internal use are allowed under the license terms.
+The self-hostable core is released under the MIT License. The hosted SaaS and enterprise roadmap can add managed hosting, premium connectors, SSO, advanced analytics, support, and dedicated deployment options while keeping the core platform open.
 
 For security-sensitive deployments, review `docs/security-compliance.md` and replace all development defaults before exposing the stack outside a trusted local network.

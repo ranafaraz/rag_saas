@@ -25,9 +25,17 @@ from typing import List, Annotated
 from starlette.concurrency import run_in_threadpool
 
 from auth import verify_credentials
-from models import ChatRequest, ChatResponse, StreamChatChunk, IngestUrlsRequest
+from models import (
+    ChatRequest,
+    ChatResponse,
+    StreamChatChunk,
+    IngestUrlsRequest,
+    PublicQueryRequest,
+    PublicSourceRequest,
+    PublicDocumentRequest,
+)
 from services.audit import log_request, log_request_async, fetch_recent_logs
-from celery_app import ingest_document_task, ingest_urls_task
+from celery_app import celery_app, ingest_document_task, ingest_urls_task
 
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", tempfile.gettempdir())
 RESPONSE_CACHE_TTL_SECONDS = int(os.getenv("RESPONSE_CACHE_TTL_SECONDS", 900))
@@ -223,9 +231,138 @@ def record_usage_event(tenant_id: str, event_type: str, quantity: int = 1, metad
         print(f"[USAGE] Failed to record usage event: {exc}")
 
 
+def record_rag_trace(
+    creds: dict,
+    query: str,
+    response: ChatResponse,
+    latency_ms: int,
+    status_label: str = "success",
+    refusal_reason: str = "",
+) -> None:
+    if not RAG_INTERNAL_INGEST_TOKEN:
+        return
+    try:
+        import httpx
+        httpx.post(
+            f"{CORE_API_URL}/api/rag-traces/record/",
+            json={
+                "tenant": creds.get("tenant_id"),
+                "api_key": creds.get("api_key_id"),
+                "api_key_prefix": creds.get("api_key_prefix", ""),
+                "query": query,
+                "roles": creds.get("roles", []),
+                "top_chunks": [
+                    {"title": citation.title, "source": citation.source, "score": citation.score}
+                    for citation in response.citations
+                ],
+                "citation_count": len(response.citations),
+                "insufficient_evidence": response.insufficient_evidence,
+                "refusal_reason": refusal_reason,
+                "latency_ms": latency_ms,
+                "cost_units": max(len(query), 1),
+                "status": status_label,
+            },
+            headers={
+                "X-Ingestion-Token": RAG_INTERNAL_INGEST_TOKEN,
+                "Host": CORE_API_HOST_HEADER,
+            },
+            timeout=5.0,
+        )
+    except Exception as exc:
+        print(f"[TRACE] Failed to record RAG trace: {exc}")
+
+
+def record_integration_job(
+    creds: dict,
+    job_type: str,
+    external_task_id: str,
+    request_payload: dict,
+    status_label: str = "queued",
+    result: dict | None = None,
+    error: str = "",
+) -> None:
+    if not RAG_INTERNAL_INGEST_TOKEN:
+        return
+    try:
+        import httpx
+        httpx.post(
+            f"{CORE_API_URL}/api/integration-jobs/record/",
+            json={
+                "tenant": creds.get("tenant_id"),
+                "api_key": creds.get("api_key_id"),
+                "job_type": job_type,
+                "status": status_label,
+                "external_task_id": external_task_id,
+                "request": request_payload,
+                "result": result or {},
+                "error": error,
+            },
+            headers={
+                "X-Ingestion-Token": RAG_INTERNAL_INGEST_TOKEN,
+                "Host": CORE_API_HOST_HEADER,
+            },
+            timeout=5.0,
+        )
+    except Exception as exc:
+        print(f"[JOB] Failed to record integration job: {exc}")
+
+
+def verify_integration_job_owner(creds: dict, job_id: str) -> dict:
+    if not RAG_INTERNAL_INGEST_TOKEN:
+        raise HTTPException(status_code=503, detail="Job lookup is not configured")
+    try:
+        import httpx
+        response = httpx.post(
+            f"{CORE_API_URL}/api/integration-jobs/lookup/",
+            json={
+                "tenant": creds.get("tenant_id"),
+                "external_task_id": job_id,
+            },
+            headers={
+                "X-Ingestion-Token": RAG_INTERNAL_INGEST_TOKEN,
+                "Host": CORE_API_HOST_HEADER,
+            },
+            timeout=5.0,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Job lookup unavailable: {exc}")
+    if response.status_code == 404:
+        raise HTTPException(status_code=404, detail="Unknown job for this tenant")
+    if response.status_code != 200:
+        raise HTTPException(status_code=503, detail=f"Job lookup failed ({response.status_code})")
+    return response.json()
+
+
 async def record_usage_event_async(tenant_id: str, event_type: str, quantity: int = 1, metadata: dict | None = None) -> None:
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, record_usage_event, tenant_id, event_type, quantity, metadata)
+
+
+def _require_scope(creds: dict, scope: str) -> None:
+    scopes = set(creds.get("scopes") or [])
+    if scope not in scopes and "admin" not in scopes:
+        raise HTTPException(status_code=403, detail=f"API credential is missing required scope: {scope}")
+
+
+def _ensure_usage_available(creds: dict, feature: str) -> None:
+    entitlement = ((creds.get("usage") or {}).get("entitlements") or {}).get(feature)
+    if not entitlement:
+        return
+    limit = int(entitlement.get("limit") or 0)
+    used = int(entitlement.get("used") or 0)
+    if limit and used >= limit:
+        raise HTTPException(status_code=402, detail=f"{feature} quota exceeded ({used}/{limit})")
+
+
+def _effective_roles(creds: dict, requested_roles: list[str] | None = None) -> list[str]:
+    allowed = {str(role) for role in creds.get("roles", [])}
+    requested = {str(role) for role in (requested_roles or []) if str(role).strip()}
+    if requested:
+        selected = sorted(allowed & requested)
+        if not selected:
+            raise HTTPException(status_code=403, detail="Requested roles are not allowed for this credential")
+        return selected
+    return sorted(allowed)
 
 
 def _apply_strong_grounded_fallback(answer: str, relevant_chunks: list, query_terms: set[str]) -> tuple[str, list, bool]:
@@ -273,6 +410,133 @@ app.add_middleware(
 @app.get("/", tags=["Health"])
 def health_check():
     return {"status": "healthy", "service": "rag-engine"}
+
+
+@app.post("/v1/query", response_model=ChatResponse, tags=["Public API"])
+async def public_query_endpoint(
+    request: PublicQueryRequest,
+    creds: Annotated[dict, Depends(verify_credentials)],
+    background_tasks: BackgroundTasks,
+):
+    _require_scope(creds, "query")
+    _ensure_usage_available(creds, "chat_messages")
+    start = time.time()
+    response = await chat_endpoint(ChatRequest(query=request.query), creds, background_tasks)
+    background_tasks.add_task(
+        record_rag_trace,
+        creds,
+        request.query,
+        response,
+        int((time.time() - start) * 1000),
+        "success",
+        "insufficient_evidence" if response.insufficient_evidence else "",
+    )
+    return response
+
+
+@app.post(
+    "/v1/query/stream",
+    tags=["Public API"],
+    responses={200: {"content": {"text/event-stream": {}}}},
+)
+async def public_query_stream_endpoint(
+    request: PublicQueryRequest,
+    creds: Annotated[dict, Depends(verify_credentials)],
+):
+    _require_scope(creds, "stream")
+    _ensure_usage_available(creds, "chat_messages")
+    return await chat_stream_endpoint(ChatRequest(query=request.query), creds)
+
+
+@app.post("/v1/sources", tags=["Public API"])
+async def public_source_endpoint(
+    request: PublicSourceRequest,
+    creds: Annotated[dict, Depends(verify_credentials)],
+    background_tasks: BackgroundTasks,
+):
+    _require_scope(creds, "ingest")
+    _ensure_usage_available(creds, "ingestion_runs")
+    roles = _effective_roles(creds, request.roles)
+    task = ingest_urls_task.delay(
+        creds["tenant_id"],
+        request.title,
+        roles,
+        [request.url],
+        request.crawl_options.model_dump(),
+    )
+    payload = {
+        "title": request.title,
+        "url": request.url,
+        "roles": roles,
+        "crawl_options": request.crawl_options.model_dump(),
+    }
+    background_tasks.add_task(record_integration_job, creds, "ingest_url", task.id, payload)
+    background_tasks.add_task(record_usage_event, creds["tenant_id"], "ingestion_run", 1, {"source": "v1_sources"})
+    return {"job_id": task.id, "status": "queued", "source": request.url}
+
+
+@app.post("/v1/documents", tags=["Public API"])
+async def public_document_endpoint(
+    request: PublicDocumentRequest,
+    creds: Annotated[dict, Depends(verify_credentials)],
+    background_tasks: BackgroundTasks,
+):
+    _require_scope(creds, "ingest")
+    _ensure_usage_available(creds, "ingestion_runs")
+    _ensure_usage_available(creds, "documents")
+    roles = _effective_roles(creds, request.roles)
+    safe_name = hashlib.sha256(f"{creds['tenant_id']}:{request.title}:{time.time()}".encode()).hexdigest()[:24]
+    dest = Path(UPLOAD_DIR) / f"{creds['tenant_id']}_{safe_name}.txt"
+    await run_in_threadpool(dest.write_text, request.content, "utf-8")
+    task = ingest_document_task.delay(creds["tenant_id"], request.title, roles, "file", str(dest))
+    payload = {
+        "title": request.title,
+        "source_uri": request.source_uri,
+        "roles": roles,
+        "content_length": len(request.content),
+    }
+    background_tasks.add_task(record_integration_job, creds, "ingest_document", task.id, payload)
+    background_tasks.add_task(record_usage_event, creds["tenant_id"], "ingestion_run", 1, {"source": "v1_documents"})
+    background_tasks.add_task(record_usage_event, creds["tenant_id"], "document_ingested", 1, {"source": "v1_documents"})
+    return {"job_id": task.id, "status": "queued", "filename": dest.name}
+
+
+@app.get("/v1/jobs/{job_id}", tags=["Public API"])
+async def public_job_status_endpoint(
+    job_id: str,
+    creds: Annotated[dict, Depends(verify_credentials)],
+):
+    _require_scope(creds, "usage")
+    job_record = await run_in_threadpool(verify_integration_job_owner, creds, job_id)
+    try:
+        from celery.result import AsyncResult
+        result = AsyncResult(job_id, app=celery_app)
+        payload = result.result if result.ready() and isinstance(result.result, dict) else {}
+        return {
+            "job_id": job_id,
+            "status": result.status.lower(),
+            "ready": result.ready(),
+            "successful": result.successful() if result.ready() else False,
+            "record": job_record,
+            "result": payload,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Job backend unavailable: {exc}")
+
+
+@app.get("/v1/usage", tags=["Public API"])
+async def public_usage_endpoint(
+    creds: Annotated[dict, Depends(verify_credentials)],
+):
+    _require_scope(creds, "usage")
+    return {
+        "tenant_id": creds.get("tenant_id"),
+        "subscription": creds.get("subscription"),
+        "usage": creds.get("usage"),
+        "api_key_prefix": creds.get("api_key_prefix", ""),
+        "scopes": creds.get("scopes", []),
+        "rate_limit_per_minute": creds.get("rate_limit_per_minute"),
+    }
 
 
 @app.get(
@@ -392,7 +656,10 @@ async def chat_endpoint(
                 insufficient_evidence=True,
             )
         else:
-            answer, citations = generate_rag_answer(request.query, relevant_chunks, base_prompt=base_prompt)
+            answer, citations = generate_rag_answer(
+                request.query, relevant_chunks, base_prompt=base_prompt,
+                llm_config=creds.get("generation_config"),
+            )
             answer, fallback_citations, insufficient = _apply_strong_grounded_fallback(
                 answer,
                 relevant_chunks,
@@ -524,7 +791,8 @@ async def chat_stream_endpoint(
 
             # Stream tokens from Ollama
             full_answer = ""
-            gen = await run_in_threadpool(lambda: stream_rag_answer(request.query, relevant_chunks, base_prompt))
+            _llm_config = creds.get("generation_config")
+            gen = await run_in_threadpool(lambda: stream_rag_answer(request.query, relevant_chunks, base_prompt, _llm_config))
             for token in gen:
                 full_answer += token
                 yield _sse(StreamChatChunk(chunk=token, done=False))

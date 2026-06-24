@@ -15,6 +15,8 @@ from .models import (
     PromptVersion,
     AIModelConfig,
     EvaluationRun,
+    IntegrationJob,
+    RAGTrace,
     IngestionSource,
     IngestionSchedule,
     IngestionRunLog,
@@ -87,8 +89,34 @@ class UserSerializer(serializers.ModelSerializer):
 class ApiKeySerializer(serializers.ModelSerializer):
     class Meta:
         model = ApiKey
-        fields = ['id', 'tenant', 'roles', 'name', 'key_prefix', 'created_at', 'is_active']
-        read_only_fields = ['key_prefix']
+        fields = [
+            'id',
+            'tenant',
+            'roles',
+            'name',
+            'key_prefix',
+            'scopes',
+            'expires_at',
+            'revoked_at',
+            'last_used_at',
+            'rate_limit_per_minute',
+            'created_at',
+            'is_active',
+        ]
+        read_only_fields = ['key_prefix', 'revoked_at', 'last_used_at']
+
+    def validate_scopes(self, value):
+        allowed = {'query', 'stream', 'ingest', 'usage', 'admin'}
+        scopes = value or ['query', 'stream', 'ingest', 'usage']
+        if isinstance(scopes, str):
+            scopes = [scopes]
+        if not isinstance(scopes, list):
+            raise serializers.ValidationError('scopes must be a list.')
+        normalized = sorted({str(scope).strip() for scope in scopes if str(scope).strip()})
+        invalid = set(normalized) - allowed
+        if invalid:
+            raise serializers.ValidationError(f'Unsupported scopes: {", ".join(sorted(invalid))}')
+        return normalized
 
 class DocumentSerializer(serializers.ModelSerializer):
     class Meta:
@@ -109,15 +137,71 @@ class PromptVersionSerializer(serializers.ModelSerializer):
 
 
 class AIModelConfigSerializer(serializers.ModelSerializer):
+    # BYOK key is write-only; reads return only the masked hint. The encrypted
+    # ciphertext column is never exposed through the API.
+    api_key = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    api_key_hint = serializers.CharField(read_only=True)
+
     class Meta:
         model = AIModelConfig
-        fields = '__all__'
+        exclude = ['api_key_ciphertext']
+
+    def create(self, validated_data):
+        raw_key = validated_data.pop('api_key', '')
+        instance = super().create(validated_data)
+        if raw_key:
+            instance.set_api_key(raw_key)
+            instance.save(update_fields=['api_key_ciphertext'])
+        return instance
+
+    def update(self, instance, validated_data):
+        raw_key = validated_data.pop('api_key', None)
+        instance = super().update(instance, validated_data)
+        # Only rotate the key when a non-empty value is supplied.
+        if raw_key:
+            instance.set_api_key(raw_key)
+            instance.save(update_fields=['api_key_ciphertext'])
+        return instance
 
 
 class EvaluationRunSerializer(serializers.ModelSerializer):
     class Meta:
         model = EvaluationRun
         fields = '__all__'
+
+
+class IntegrationJobSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = IntegrationJob
+        fields = '__all__'
+        read_only_fields = ['created_at', 'updated_at']
+
+
+class RAGTraceSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = RAGTrace
+        fields = '__all__'
+        read_only_fields = ['created_at']
+
+
+class SignupSerializer(serializers.Serializer):
+    organization_name = serializers.CharField(max_length=255)
+    workspace_slug = serializers.SlugField(max_length=120, required=False, allow_blank=True)
+    website_url = serializers.URLField(required=False, allow_blank=True)
+    admin_username = serializers.CharField(max_length=150)
+    admin_email = serializers.EmailField()
+    admin_password = serializers.CharField(min_length=10, write_only=True)
+    plan_code = serializers.SlugField(max_length=64, required=False, allow_blank=True)
+
+    def validate_admin_username(self, value):
+        if User.objects.filter(username=value).exists():
+            raise serializers.ValidationError('Username is already taken.')
+        return value
+
+    def validate_admin_email(self, value):
+        if User.objects.filter(email=value).exists():
+            raise serializers.ValidationError('Email is already registered.')
+        return value
 
 
 class IngestionSourceSerializer(serializers.ModelSerializer):

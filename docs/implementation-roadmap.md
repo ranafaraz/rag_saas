@@ -1,10 +1,13 @@
 # Implementation Roadmap
 
 ## Phase 1 - Product Foundation
-Status: implemented in this branch as the first market-ready slice.
+Status: implemented as the first market-ready slice, then expanded for horizontal open-core SaaS integration.
 
 - Add commercial models: plans, subscriptions, entitlements, usage events, invoices, invitations, AI model configs, prompt versions, and evaluation runs.
 - Add tenant-scoped authenticated APIs and JWT support.
+- Add self-serve signup, default tenant provisioning, scoped API keys, rotation, revocation, expiry, and rate-limit metadata.
+- Add public `/v1` RAG integration endpoints for query, streaming, source ingestion, document ingestion, job status, and usage.
+- Add integration jobs and RAG traces for quality reporting.
 - Add Stripe checkout/webhook endpoints and billing summaries.
 - Add usage recording from RAG chat and ingestion paths.
 - Add vLLM/OpenAI-compatible generation path and BGE-M3 embedding gateway.
@@ -16,12 +19,13 @@ Acceptance:
 - Frontend builds successfully.
 - RAG tests pass with external services mocked.
 
-## Phase 2 - Identity and Onboarding
+## Phase 2 - Identity, Onboarding, and Developer Experience
 - Deploy Keycloak with a `rag-saas` realm.
 - Add OIDC login to the frontend.
 - Add invitation acceptance and role assignment workflow.
 - Add tenant provisioning after successful Stripe checkout.
 - Add admin onboarding checklist.
+- Add SDK snippets and deployable examples for server-side web, mobile backend, and CRM middleware integrations.
 
 Acceptance:
 - A new tenant admin can subscribe, sign in through Keycloak, invite users, and see billing state.
@@ -55,6 +59,7 @@ Acceptance:
 - Add connector marketplace.
 - Add customer-facing security page.
 - Add in-app quality reports for admins.
+- Add open-core packaging notes for self-hosted core versus hosted premium features.
 
 Acceptance:
 - The product can support a paid pilot without manual database edits.

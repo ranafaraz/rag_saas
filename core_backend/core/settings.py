@@ -155,7 +155,7 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': [
         'saas.authentication.KeycloakJWTAuthentication',
-        'rest_framework_simplejwt.authentication.JWTAuthentication',
+        'saas.authentication.WorkspaceJWTAuthentication',
         'rest_framework.authentication.SessionAuthentication',
         'rest_framework.authentication.BasicAuthentication',
     ],

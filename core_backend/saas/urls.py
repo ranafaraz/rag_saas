@@ -16,16 +16,26 @@ from .views import (
     PromptVersionViewSet,
     AIModelConfigViewSet,
     EvaluationRunViewSet,
+    IntegrationJobViewSet,
+    RAGTraceViewSet,
     IngestionSourceViewSet,
     IngestionScheduleViewSet,
     IngestionRunLogViewSet,
     CurrentUserView,
     UsageSummaryView,
+    UsageSavingsView,
     BillingSummaryView,
     BillingCheckoutView,
+    SignupView,
+    IntegrationQuickstartView,
     StripeWebhookView,
     VerifyAPIKeyView,
     UserLoginView,
+    SelectWorkspaceView,
+    MyWorkspacesView,
+    VerifyEmailView,
+    CreateWorkspaceView,
+    AcceptInvitationView,
     VerifyUserTokenView,
 )
 
@@ -45,18 +55,28 @@ router.register(r'base-prompts', BasePromptViewSet)
 router.register(r'prompt-versions', PromptVersionViewSet)
 router.register(r'ai-model-configs', AIModelConfigViewSet)
 router.register(r'evaluation-runs', EvaluationRunViewSet)
+router.register(r'integration-jobs', IntegrationJobViewSet)
+router.register(r'rag-traces', RAGTraceViewSet)
 router.register(r'ingestion-sources', IngestionSourceViewSet)
 router.register(r'ingestion-schedules', IngestionScheduleViewSet)
 router.register(r'ingestion-run-logs', IngestionRunLogViewSet)
 
 urlpatterns = [
+    path('signup/', SignupView.as_view(), name='signup'),
     path('auth/me/', CurrentUserView.as_view(), name='current-user'),
     path('auth/verify/', VerifyAPIKeyView.as_view(), name='verify-api-key'),
     path('auth/login/', UserLoginView.as_view(), name='user-login'),
+    path('auth/workspace/', SelectWorkspaceView.as_view(), name='select-workspace'),
+    path('auth/workspaces/', MyWorkspacesView.as_view(), name='my-workspaces'),
+    path('auth/workspaces/create/', CreateWorkspaceView.as_view(), name='create-workspace'),
+    path('auth/verify-email/', VerifyEmailView.as_view(), name='verify-email'),
+    path('auth/invitations/accept/', AcceptInvitationView.as_view(), name='accept-invitation'),
     path('auth/verify-user-token/', VerifyUserTokenView.as_view(), name='verify-user-token'),
     path('usage/summary/', UsageSummaryView.as_view(), name='usage-summary'),
+    path('usage/savings/', UsageSavingsView.as_view(), name='usage-savings'),
     path('billing/summary/', BillingSummaryView.as_view(), name='billing-summary'),
     path('billing/checkout/', BillingCheckoutView.as_view(), name='billing-checkout'),
+    path('integration/quickstart/', IntegrationQuickstartView.as_view(), name='integration-quickstart'),
     path('billing/stripe/webhook/', StripeWebhookView.as_view(), name='stripe-webhook'),
     path('', include(router.urls)),
 ]

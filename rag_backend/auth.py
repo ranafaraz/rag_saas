@@ -35,9 +35,12 @@ def _cache_key(token: str) -> str:
 
 async def verify_credentials(credentials: HTTPAuthorizationCredentials = Security(security)) -> dict:
     token = credentials.credentials
+    is_api_key = token.startswith("sk_")
 
     # 1. Check Redis cache first
-    if _redis:
+    # API keys are not cached so revocation, expiry, scope, and rate-limit
+    # decisions from Core API apply on every public integration request.
+    if _redis and not is_api_key:
         try:
             cached = _redis.get(_cache_key(token))
             if cached:
@@ -46,7 +49,7 @@ async def verify_credentials(credentials: HTTPAuthorizationCredentials = Securit
             pass
 
     # 2. Validate against Django Core API
-    verify_path = "/api/auth/verify/" if token.startswith("sk_") else "/api/auth/verify-user-token/"
+    verify_path = "/api/auth/verify/" if is_api_key else "/api/auth/verify-user-token/"
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(
@@ -66,7 +69,7 @@ async def verify_credentials(credentials: HTTPAuthorizationCredentials = Securit
         raise HTTPException(status_code=402, detail="Tenant subscription is not active")
 
     # 3. Store in Redis cache (fire-and-forget)
-    if _redis:
+    if _redis and not is_api_key:
         try:
             _redis.setex(_cache_key(token), CACHE_TTL, json.dumps(payload))
         except Exception:

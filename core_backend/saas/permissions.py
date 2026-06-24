@@ -4,6 +4,11 @@ from rest_framework.permissions import SAFE_METHODS, BasePermission
 def user_role_names(user) -> set[str]:
     if not getattr(user, "is_authenticated", False):
         return set()
+    # Prefer roles resolved from the active workspace Membership (set by
+    # WorkspaceJWTAuthentication); fall back to the legacy user.roles M2M.
+    active_roles = getattr(user, "_active_role_names", None)
+    if active_roles is not None:
+        return {name.lower() for name in active_roles}
     try:
         return {name.lower() for name in user.roles.values_list("name", flat=True)}
     except Exception:
@@ -15,6 +20,9 @@ def can_manage_tenant(user) -> bool:
         return False
     if getattr(user, "is_superuser", False):
         return True
+    active_is_admin = getattr(user, "_active_is_admin", None)
+    if active_is_admin is not None:
+        return bool(active_is_admin)
     if getattr(user, "is_tenant_admin", False):
         return True
     return "admin" in user_role_names(user)

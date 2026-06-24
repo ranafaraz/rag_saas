@@ -53,3 +53,36 @@ class IngestUrlsRequest(BaseModel):
     roles: List[str]
     source_uris: List[str]
     crawl_options: CrawlOptions = CrawlOptions()
+
+
+class PublicQueryRequest(BaseModel):
+    query: str
+
+    @field_validator("query")
+    @classmethod
+    def public_query_not_empty(cls, v: str) -> str:
+        return ChatRequest(query=v).query
+
+
+class PublicSourceRequest(BaseModel):
+    title: str
+    url: str
+    roles: List[str] = []
+    crawl_options: CrawlOptions = CrawlOptions()
+
+
+class PublicDocumentRequest(BaseModel):
+    title: str
+    content: str
+    roles: List[str] = []
+    source_uri: str = "api://inline-document"
+
+    @field_validator("content")
+    @classmethod
+    def content_not_empty(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("content must not be empty")
+        if len(v) > 2_000_000:
+            raise ValueError("content too large (max 2,000,000 chars)")
+        return v

@@ -13,6 +13,7 @@ from .models import (
     IngestionSchedule,
     IngestionRunLog,
     UsageEvent,
+    Entitlement,
 )
 import secrets
 from django.utils import timezone
@@ -31,6 +32,7 @@ def _create_api_key(tenant, roles, raw_key: str, name: str = "Test key") -> ApiK
         name=name,
         key_prefix=raw_key[:10],
         hashed_key=make_password(raw_key),
+        scopes=["query", "stream", "ingest", "usage"],
         is_active=True,
     )
     key.roles.set(roles)
@@ -61,6 +63,18 @@ def _activate_subscription(tenant, code: str = "test-plan"):
     )
     subscription.apply_plan_defaults()
     subscription.save()
+    for feature, limit in {
+        "seats": subscription.seat_limit,
+        "documents": subscription.document_quota,
+        "sources": subscription.source_quota,
+        "ingestion_runs": subscription.ingestion_runs_per_month,
+        "chat_messages": subscription.chat_messages_per_month,
+    }.items():
+        Entitlement.objects.update_or_create(
+            tenant=tenant,
+            feature=feature,
+            defaults={"limit": limit, "source": "test"},
+        )
     return subscription
 
 
@@ -150,6 +164,77 @@ class ApiKeyVerifyTests(TestCase):
         Subscription.objects.filter(tenant=self.tenant).update(status="canceled")
         resp = self.client.post("/api/auth/verify/", {"token": self.raw_key}, format="json")
         self.assertEqual(resp.status_code, 402)
+
+    def test_missing_scope_returns_403(self):
+        ApiKey.objects.filter(key_prefix=self.raw_key[:10]).update(scopes=["query"])
+        resp = self.client.post("/api/auth/verify/", {"token": self.raw_key, "scope": "ingest"}, format="json")
+        self.assertEqual(resp.status_code, 403)
+
+    def test_revoked_key_returns_401(self):
+        ApiKey.objects.filter(key_prefix=self.raw_key[:10]).update(is_active=False, revoked_at=timezone.now())
+        resp = self.client.post("/api/auth/verify/", {"token": self.raw_key}, format="json")
+        self.assertEqual(resp.status_code, 401)
+
+    def test_expired_key_returns_401(self):
+        ApiKey.objects.filter(key_prefix=self.raw_key[:10]).update(expires_at=timezone.now() - timedelta(minutes=1))
+        resp = self.client.post("/api/auth/verify/", {"token": self.raw_key}, format="json")
+        self.assertEqual(resp.status_code, 401)
+
+
+class SignupAndKeyLifecycleTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.plan = Plan.objects.create(
+            code="developer-starter",
+            name="Developer Starter",
+            monthly_price_cents=0,
+            seat_limit=5,
+            document_quota=10,
+            source_quota=5,
+            ingestion_runs_per_month=10,
+            chat_messages_per_month=100,
+            is_public=True,
+        )
+
+    def test_signup_provisions_tenant_admin_subscription_and_key(self):
+        resp = self.client.post(
+            "/api/signup/",
+            {
+                "organization_name": "Acme Apps",
+                "workspace_slug": "acme-apps",
+                "admin_username": "acme-admin",
+                "admin_email": "admin@acme.example",
+                "admin_password": "super-secret-123",
+                "plan_code": self.plan.code,
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.data["tenant"]["slug"], "acme-apps")
+        self.assertIn("raw_key", resp.data["api_key"])
+        tenant = Tenant.objects.get(slug="acme-apps")
+        self.assertTrue(Subscription.objects.filter(tenant=tenant, status="trialing").exists())
+        self.assertTrue(User.objects.filter(tenant=tenant, is_tenant_admin=True).exists())
+
+    def test_rotate_and_revoke_api_key(self):
+        tenant = Tenant.objects.create(name="Key Tenant")
+        role = Role.objects.create(tenant=tenant, name="Admin")
+        user = _tenant_admin(tenant, role)
+        self.client.force_authenticate(user)
+        raw = _gen_key("sk_key_")
+        key = _create_api_key(tenant, [role], raw)
+
+        rotate = self.client.post(f"/api/api-keys/{key.id}/rotate/")
+        self.assertEqual(rotate.status_code, 200)
+        self.assertIn("raw_key", rotate.data)
+        key.refresh_from_db()
+        self.assertNotEqual(key.key_prefix, raw[:10])
+
+        revoke = self.client.post(f"/api/api-keys/{key.id}/revoke/")
+        self.assertEqual(revoke.status_code, 200)
+        key.refresh_from_db()
+        self.assertFalse(key.is_active)
+        self.assertIsNotNone(key.revoked_at)
 
 
 class DocumentTests(TestCase):
@@ -300,3 +385,208 @@ class UsageRecordingTests(TestCase):
             views.RAG_INTERNAL_INGEST_TOKEN = old_token
         self.assertEqual(resp.status_code, 201)
         self.assertEqual(UsageEvent.objects.filter(tenant=self.tenant, event_type="chat_message").count(), 1)
+
+    def test_usage_record_blocks_exceeded_chat_quota(self):
+        from saas import views
+
+        entitlement = self.tenant.entitlements.get(feature="chat_messages")
+        entitlement.limit = 1
+        entitlement.used = 1
+        entitlement.save()
+        old_token = views.RAG_INTERNAL_INGEST_TOKEN
+        views.RAG_INTERNAL_INGEST_TOKEN = "test-token"
+        try:
+            resp = self.client.post(
+                "/api/usage-events/record/",
+                {"tenant": str(self.tenant.id), "event_type": "chat_message", "quantity": 1},
+                HTTP_X_INGESTION_TOKEN="test-token",
+                format="json",
+            )
+        finally:
+            views.RAG_INTERNAL_INGEST_TOKEN = old_token
+        self.assertEqual(resp.status_code, 402)
+
+
+class WorkspaceAuthTests(TestCase):
+    """Production tenancy: active tenant is derived from a verified Membership,
+    never from a client-supplied tenant_id."""
+
+    def setUp(self):
+        import os
+        from .models import Membership
+
+        # Disable optional Keycloak OIDC auth so the local SimpleJWT path is exercised.
+        self._env = patch.dict(os.environ, {"KEYCLOAK_JWKS_URL": "", "KEYCLOAK_AUDIENCE": ""})
+        self._env.start()
+        self.addCleanup(self._env.stop)
+
+        self.client = APIClient()
+        self.tenant_a = Tenant.objects.create(name="Tenant A", slug="tenant-a")
+        self.tenant_b = Tenant.objects.create(name="Tenant B", slug="tenant-b")
+        _activate_subscription(self.tenant_a, "plan-a")
+        _activate_subscription(self.tenant_b, "plan-b")
+        self.role_a = Role.objects.create(tenant=self.tenant_a, name="Admin")
+        self.role_b = Role.objects.create(tenant=self.tenant_b, name="Admin")
+
+        # user_a belongs ONLY to tenant A.
+        self.user_a = User.objects.create_user(
+            username="alice", email="alice@example.com", password="password123",
+            is_email_verified=True,
+        )
+        m = Membership.objects.create(user=self.user_a, tenant=self.tenant_a, role="owner", status="active")
+        m.roles.add(self.role_a)
+
+        # user_b belongs ONLY to tenant B (owns a document in B).
+        self.user_b = User.objects.create_user(
+            username="bob", email="bob@example.com", password="password123",
+            is_email_verified=True,
+        )
+        mb = Membership.objects.create(user=self.user_b, tenant=self.tenant_b, role="owner", status="active")
+        mb.roles.add(self.role_b)
+        self.doc_b = Document.objects.create(
+            tenant=self.tenant_b, title="B secret", source_type="text", source_uri="x"
+        )
+
+    def _login(self, username, password="password123"):
+        resp = self.client.post("/api/auth/login/", {"username": username, "password": password}, format="json")
+        self.assertEqual(resp.status_code, 200, resp.data)
+        return resp.data
+
+    def test_login_does_not_accept_tenant_id_and_returns_workspaces(self):
+        data = self._login("alice")
+        self.assertIn("identity_token", data)
+        # Login response is purely identity — it carries no workspace-scoped token.
+        self.assertNotIn("access_token", data)
+        slugs = {w["tenant_slug"] for w in data["workspaces"]}
+        self.assertEqual(slugs, {"tenant-a"})
+
+    def test_select_own_workspace_succeeds(self):
+        identity = self._login("alice")["identity_token"]
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {identity}")
+        resp = self.client.post("/api/auth/workspace/", {"workspace_slug": "tenant-a"}, format="json")
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.assertEqual(resp.data["workspace"]["tenant_slug"], "tenant-a")
+        self.assertTrue(resp.data["access_token"])
+
+    def test_cannot_select_foreign_workspace_even_with_slug_or_id(self):
+        identity = self._login("alice")["identity_token"]
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {identity}")
+        # By slug
+        resp = self.client.post("/api/auth/workspace/", {"workspace_slug": "tenant-b"}, format="json")
+        self.assertEqual(resp.status_code, 403, resp.data)
+        # By raw id (the old injection vector)
+        resp = self.client.post("/api/auth/workspace/", {"tenant_id": str(self.tenant_b.id)}, format="json")
+        self.assertEqual(resp.status_code, 403, resp.data)
+
+    def test_identity_token_cannot_touch_tenant_scoped_data(self):
+        identity = self._login("alice")["identity_token"]
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {identity}")
+        # No workspace selected -> no tenant scope -> empty results.
+        resp = self.client.get("/api/documents/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["count"], 0)
+
+    def test_workspace_token_scopes_to_membership_and_blocks_cross_tenant(self):
+        # Alice enters tenant A; she must never see tenant B's document.
+        identity = self._login("alice")["identity_token"]
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {identity}")
+        ws = self.client.post("/api/auth/workspace/", {"workspace_slug": "tenant-a"}, format="json").data
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {ws['access_token']}")
+
+        listing = self.client.get("/api/documents/")
+        self.assertEqual(listing.data["count"], 0)
+        # Direct object access to B's document is denied.
+        detail = self.client.get(f"/api/documents/{self.doc_b.id}/")
+        self.assertIn(detail.status_code, (403, 404))
+
+    def test_verify_user_token_rejects_identity_token(self):
+        identity = self._login("alice")["identity_token"]
+        resp = self.client.post("/api/auth/verify-user-token/", {"token": identity}, format="json")
+        self.assertEqual(resp.status_code, 401, resp.data)
+
+    def test_verify_user_token_accepts_workspace_token_with_correct_tenant(self):
+        identity = self._login("alice")["identity_token"]
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {identity}")
+        ws = self.client.post("/api/auth/workspace/", {"workspace_slug": "tenant-a"}, format="json").data
+        self.client.credentials()
+        resp = self.client.post("/api/auth/verify-user-token/", {"token": ws["access_token"]}, format="json")
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.assertEqual(resp.data["tenant_id"], str(self.tenant_a.id))
+
+
+class Phase2LLMConfigTests(TestCase):
+    """BYOK + usage savings: keys are never returned raw; savings endpoint works."""
+
+    def setUp(self):
+        import os
+        from .models import Membership, AIModelConfig
+        self._env = patch.dict(os.environ, {"KEYCLOAK_JWKS_URL": "", "KEYCLOAK_AUDIENCE": ""})
+        self._env.start()
+        self.addCleanup(self._env.stop)
+        self.AIModelConfig = AIModelConfig
+
+        self.client = APIClient()
+        self.tenant = Tenant.objects.create(name="Acme", slug="acme")
+        _activate_subscription(self.tenant, "acme-plan")
+        self.role = Role.objects.create(tenant=self.tenant, name="Admin")
+        self.user = User.objects.create_user(
+            username="ada", email="ada@example.com", password="password123", is_email_verified=True,
+        )
+        m = Membership.objects.create(user=self.user, tenant=self.tenant, role="owner", status="active")
+        m.roles.add(self.role)
+
+    def _ws_client(self):
+        login = self.client.post("/api/auth/login/", {"username": "ada", "password": "password123"}, format="json").data
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {login['identity_token']}")
+        ws = self.client.post("/api/auth/workspace/", {"workspace_slug": "acme"}, format="json").data
+        c = APIClient()
+        c.credentials(HTTP_AUTHORIZATION=f"Bearer {ws['access_token']}")
+        return c
+
+    def test_byok_key_is_encrypted_and_never_returned_raw(self):
+        c = self._ws_client()
+        resp = c.post("/api/ai-model-configs/", {
+            "tenant": str(self.tenant.id),
+            "purpose": "generation",
+            "provider": "openai",
+            "model_name": "gpt-4o-mini",
+            "api_key": "sk-supersecret-1234",
+            "is_default": True,
+        }, format="json")
+        self.assertEqual(resp.status_code, 201, resp.data)
+        self.assertNotIn("api_key", resp.data)
+        self.assertNotIn("api_key_ciphertext", resp.data)
+        self.assertEqual(resp.data.get("api_key_hint"), "••••1234")
+        # Stored ciphertext must not equal the plaintext, and must decrypt back.
+        cfg = self.AIModelConfig.objects.get(id=resp.data["id"])
+        self.assertNotIn("supersecret", cfg.api_key_ciphertext)
+        self.assertEqual(cfg.api_key, "sk-supersecret-1234")
+
+    def test_generation_config_flows_to_verify_endpoint(self):
+        c = self._ws_client()
+        c.post("/api/ai-model-configs/", {
+            "tenant": str(self.tenant.id), "purpose": "generation", "provider": "deepseek",
+            "model_name": "deepseek-chat", "api_key": "sk-deep", "is_default": True,
+        }, format="json")
+        # The internal verify endpoint (used by rag_backend) must carry the decrypted config.
+        login = self.client.post("/api/auth/login/", {"username": "ada", "password": "password123"}, format="json").data
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {login['identity_token']}")
+        ws = self.client.post("/api/auth/workspace/", {"workspace_slug": "acme"}, format="json").data
+        self.client.credentials()
+        verify = self.client.post("/api/auth/verify-user-token/", {"token": ws["access_token"]}, format="json")
+        self.assertEqual(verify.status_code, 200, verify.data)
+        gen = verify.data["generation_config"]
+        self.assertEqual(gen["provider"], "deepseek")
+        self.assertEqual(gen["api_key"], "sk-deep")
+
+    def test_savings_dashboard_returns_aggregates(self):
+        from .models import RAGTrace
+        RAGTrace.objects.create(tenant=self.tenant, query="q1", citation_count=2, latency_ms=300, cost_units=1)
+        RAGTrace.objects.create(tenant=self.tenant, query="q2", citation_count=0, insufficient_evidence=True, latency_ms=100)
+        c = self._ws_client()
+        resp = c.get("/api/usage/savings/")
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.assertEqual(resp.data["queries"], 2)
+        self.assertEqual(resp.data["grounded_rate"], 0.5)
+        self.assertIn("estimated_savings_usd", resp.data["cost"])
+        self.assertIn("estimated_energy_wh", resp.data)

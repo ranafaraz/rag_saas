@@ -8,4 +8,5 @@ django-cors-headers>=4.3
 django-filter>=24.0
 requests>=2.31
 PyJWT[crypto]>=2.8
+cryptography>=42.0
 stripe>=9.0

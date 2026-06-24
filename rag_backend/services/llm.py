@@ -75,42 +75,22 @@ Question: {query}
 Answer:"""
 
 
-def _generate_with_openai_compatible(prompt: str) -> str:
-    from openai import OpenAI
-
-    client = OpenAI(base_url=VLLM_BASE_URL, api_key=VLLM_API_KEY)
-    response = client.chat.completions.create(
-        model=VLLM_MODEL,
-        temperature=0.0,
-        max_tokens=OLLAMA_NUM_PREDICT,
-        messages=[
-            {"role": "system", "content": "Follow the user prompt exactly and answer only from provided context."},
-            {"role": "user", "content": prompt},
-        ],
-    )
-    return (response.choices[0].message.content or "").strip()
-
-
-def generate_rag_answer(query: str, chunks: list, base_prompt: str = "") -> Tuple[str, List[dict]]:
+def generate_rag_answer(query: str, chunks: list, base_prompt: str = "",
+                        llm_config: dict | None = None) -> Tuple[str, List[dict]]:
     """
-    Generates a grounded answer using the configured AI gateway.
-    Production uses an OpenAI-compatible vLLM endpoint; local dev can use Ollama.
+    Generates a grounded answer using the resolved provider.
+
+    Provider selection: per-tenant ``llm_config`` (BYOK) overrides the env default,
+    which defaults to the free Groq tier and degrades to local Ollama when no key
+    is available. See ``providers.registry``.
     """
+    from providers import get_provider
+
     context_text, citations = _build_context_and_citations(chunks)
     full_prompt = _build_prompt(query, context_text, base_prompt)
 
     try:
-        if LLM_PROVIDER in {"vllm", "openai_compatible", "openai-compatible"}:
-            answer = _generate_with_openai_compatible(full_prompt)
-        else:
-            from langchain_community.llms import Ollama
-            llm = Ollama(
-                base_url=OLLAMA_BASE_URL,
-                model=OLLAMA_MODEL,
-                temperature=0.0,
-                num_predict=OLLAMA_NUM_PREDICT,
-            )
-            answer = llm.invoke(full_prompt).strip()
+        answer = get_provider(llm_config).generate(full_prompt)
     except Exception as e:
         answer = f"The AI model is currently unavailable. Please try again shortly. (Error: {str(e)[:120]})"
         return answer, []
@@ -122,44 +102,21 @@ def generate_rag_answer(query: str, chunks: list, base_prompt: str = "") -> Tupl
     return answer, citations
 
 
-def stream_rag_answer(query: str, chunks: list, base_prompt: str = "") -> Generator[str, None, list]:
+def stream_rag_answer(query: str, chunks: list, base_prompt: str = "",
+                      llm_config: dict | None = None) -> Generator[str, None, list]:
     """
-    Streams a grounded answer token-by-token using Ollama.
+    Streams a grounded answer token-by-token using the resolved provider.
     Yields text chunks as they are produced.
     Returns the citations list via StopIteration value (use as a generator).
     """
+    from providers import get_provider
+
     context_text, citations = _build_context_and_citations(chunks)
     full_prompt = _build_prompt(query, context_text, base_prompt)
 
     try:
-        if LLM_PROVIDER in {"vllm", "openai_compatible", "openai-compatible"}:
-            from openai import OpenAI
-
-            client = OpenAI(base_url=VLLM_BASE_URL, api_key=VLLM_API_KEY)
-            stream = client.chat.completions.create(
-                model=VLLM_MODEL,
-                temperature=0.0,
-                max_tokens=OLLAMA_NUM_PREDICT,
-                stream=True,
-                messages=[
-                    {"role": "system", "content": "Follow the user prompt exactly and answer only from provided context."},
-                    {"role": "user", "content": full_prompt},
-                ],
-            )
-            for event in stream:
-                token = event.choices[0].delta.content or ""
-                if token:
-                    yield token
-        else:
-            from langchain_community.llms import Ollama
-            llm = Ollama(
-                base_url=OLLAMA_BASE_URL,
-                model=OLLAMA_MODEL,
-                temperature=0.0,
-                num_predict=OLLAMA_NUM_PREDICT,
-            )
-            for chunk in llm.stream(full_prompt):
-                yield chunk
+        for token in get_provider(llm_config).stream(full_prompt):
+            yield token
     except Exception as e:
         yield f"The AI model is currently unavailable. Please try again shortly. (Error: {str(e)[:120]})"
         return []

@@ -209,15 +209,66 @@ class Role(models.Model):
 
 class User(AbstractUser):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name='users', null=True, blank=True)
+    # tenant is retained only as a "last active workspace" pointer for convenience.
+    # It is NEVER the source of truth for access control — Membership is. The active
+    # tenant for a request is derived from the verified workspace JWT claim.
+    tenant = models.ForeignKey(Tenant, on_delete=models.SET_NULL, related_name='users', null=True, blank=True)
     roles = models.ManyToManyField(Role, related_name='users', blank=True)
     branches = models.ManyToManyField('Branch', related_name='users', blank=True)
     is_tenant_admin = models.BooleanField(default=False)
+    is_email_verified = models.BooleanField(default=False)
     mfa_enabled = models.BooleanField(default=False)
     auth_provider = models.CharField(max_length=50, default='local')
 
     def __str__(self):
         return self.username
+
+
+class Membership(models.Model):
+    """
+    Source of truth for which tenants (workspaces) a user may access, and the
+    role they hold within each. Replaces the demo's client-supplied tenant_id:
+    the active tenant on every request is verified against an active Membership.
+    """
+    ROLE_CHOICES = (
+        ('owner', 'Owner'),
+        ('admin', 'Admin'),
+        ('member', 'Member'),
+    )
+    STATUS_CHOICES = (
+        ('active', 'Active'),
+        ('invited', 'Invited'),
+        ('suspended', 'Suspended'),
+    )
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='memberships')
+    tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name='memberships')
+    role = models.CharField(max_length=16, choices=ROLE_CHOICES, default='member')
+    # Fine-grained RAG roles (Faculty/Student/Developer/...) scoped to THIS workspace.
+    roles = models.ManyToManyField(Role, related_name='memberships', blank=True)
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default='active')
+    invited_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True, related_name='sent_memberships'
+    )
+    # Per-workspace onboarding progress (tour seen, checklist steps done) — see Phase 4.
+    onboarding_state = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ('user', 'tenant')
+        indexes = [
+            models.Index(fields=['user', 'status']),
+            models.Index(fields=['tenant', 'status']),
+        ]
+
+    def __str__(self):
+        return f"{self.user.username} @ {self.tenant.name} ({self.role})"
+
+    @property
+    def is_admin(self) -> bool:
+        return self.role in {'owner', 'admin'}
 
 class ApiKey(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -226,11 +277,24 @@ class ApiKey(models.Model):
     name = models.CharField(max_length=255)
     key_prefix = models.CharField(max_length=10, unique=True)
     hashed_key = models.CharField(max_length=128)
+    scopes = models.JSONField(default=list, blank=True)
+    expires_at = models.DateTimeField(null=True, blank=True)
+    revoked_at = models.DateTimeField(null=True, blank=True)
+    last_used_at = models.DateTimeField(null=True, blank=True)
+    rate_limit_per_minute = models.PositiveIntegerField(default=60)
     created_at = models.DateTimeField(auto_now_add=True)
     is_active = models.BooleanField(default=True)
 
     def __str__(self):
         return f"{self.name} ({self.key_prefix}...)"
+
+    @property
+    def is_usable(self):
+        if not self.is_active or self.revoked_at:
+            return False
+        if self.expires_at and self.expires_at <= timezone.now():
+            return False
+        return True
 
 class Document(models.Model):
     STATUS_CHOICES = (
@@ -291,9 +355,15 @@ class PromptVersion(models.Model):
 
 
 class AIModelConfig(models.Model):
+    # Free, no-GPU hosted default is 'groq'. Tenants may bring their own key for
+    # any of the hosted providers; 'ollama'/'vllm'/'custom' remain for self-host.
     PROVIDER_CHOICES = (
+        ('groq', 'Groq (free hosted)'),
+        ('openai', 'OpenAI'),
+        ('anthropic', 'Anthropic Claude'),
+        ('deepseek', 'DeepSeek'),
         ('vllm', 'vLLM OpenAI-Compatible'),
-        ('ollama', 'Ollama Development'),
+        ('ollama', 'Ollama (self-host)'),
         ('custom', 'Custom OpenAI-Compatible'),
     )
     PURPOSE_CHOICES = (
@@ -308,6 +378,9 @@ class AIModelConfig(models.Model):
     provider = models.CharField(max_length=40, choices=PROVIDER_CHOICES)
     model_name = models.CharField(max_length=160)
     endpoint_url = models.URLField(blank=True, default='')
+    # BYOK: the provider API key, encrypted at rest (Fernet). Never serialized raw —
+    # see api_key_hint for the masked display value.
+    api_key_ciphertext = models.TextField(blank=True, default='')
     is_default = models.BooleanField(default=False)
     config = models.JSONField(default=dict, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -322,6 +395,22 @@ class AIModelConfig(models.Model):
     def __str__(self):
         scope = self.tenant.name if self.tenant else 'Global'
         return f"{scope} - {self.purpose} - {self.model_name}"
+
+    @property
+    def api_key(self) -> str:
+        from .encryption import decrypt_secret
+        return decrypt_secret(self.api_key_ciphertext)
+
+    def set_api_key(self, raw: str) -> None:
+        from .encryption import encrypt_secret
+        self.api_key_ciphertext = encrypt_secret(raw or '')
+
+    @property
+    def api_key_hint(self) -> str:
+        raw = self.api_key
+        if not raw:
+            return ''
+        return f"••••{raw[-4:]}" if len(raw) >= 4 else '••••'
 
 
 class EvaluationRun(models.Model):
@@ -347,6 +436,70 @@ class EvaluationRun(models.Model):
 
     def __str__(self):
         return f"{self.tenant.name} - {self.name} - {self.status}"
+
+
+class IntegrationJob(models.Model):
+    STATUS_CHOICES = (
+        ('queued', 'Queued'),
+        ('running', 'Running'),
+        ('completed', 'Completed'),
+        ('failed', 'Failed'),
+    )
+    JOB_TYPE_CHOICES = (
+        ('ingest_url', 'Ingest URL'),
+        ('ingest_document', 'Ingest Document'),
+        ('eval_run', 'Evaluation Run'),
+    )
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name='integration_jobs')
+    api_key = models.ForeignKey(ApiKey, on_delete=models.SET_NULL, null=True, blank=True, related_name='integration_jobs')
+    job_type = models.CharField(max_length=40, choices=JOB_TYPE_CHOICES)
+    status = models.CharField(max_length=24, choices=STATUS_CHOICES, default='queued')
+    external_task_id = models.CharField(max_length=120, blank=True, default='')
+    request = models.JSONField(default=dict, blank=True)
+    result = models.JSONField(default=dict, blank=True)
+    error = models.TextField(blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['tenant', 'status']),
+            models.Index(fields=['external_task_id']),
+        ]
+
+    def __str__(self):
+        return f"{self.tenant.name} - {self.job_type} - {self.status}"
+
+
+class RAGTrace(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name='rag_traces')
+    api_key = models.ForeignKey(ApiKey, on_delete=models.SET_NULL, null=True, blank=True, related_name='rag_traces')
+    api_key_prefix = models.CharField(max_length=10, blank=True, default='')
+    query = models.TextField()
+    roles = models.JSONField(default=list, blank=True)
+    top_chunks = models.JSONField(default=list, blank=True)
+    citation_count = models.PositiveIntegerField(default=0)
+    insufficient_evidence = models.BooleanField(default=False)
+    refusal_reason = models.CharField(max_length=80, blank=True, default='')
+    latency_ms = models.PositiveIntegerField(default=0)
+    cost_units = models.PositiveIntegerField(default=0)
+    status = models.CharField(max_length=24, default='success')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['tenant', 'created_at']),
+            models.Index(fields=['api_key_prefix']),
+            models.Index(fields=['status']),
+        ]
+
+    def __str__(self):
+        return f"{self.tenant.name} - {self.status} - {self.created_at}"
 
 
 class IngestionSource(models.Model):
@@ -523,4 +676,3 @@ class AuditLog(models.Model):
 
     def __str__(self):
         return f"{self.action} on {self.model_name} by {self.user.username if self.user else 'System'}"
-

@@ -7,6 +7,7 @@ from saas.models import (
     UsageEvent,
     Role,
     User,
+    Membership,
     ApiKey,
     Document,
     BasePrompt,
@@ -99,6 +100,19 @@ class Command(BaseCommand):
                 },
             )
 
+        # Default free tier: Groq hosted (powerful, no local GPU). Falls back to
+        # Ollama automatically when no GROQ_API_KEY is configured.
+        AIModelConfig.objects.update_or_create(
+            tenant=None,
+            purpose='generation',
+            provider='groq',
+            model_name=os.getenv('GROQ_MODEL', 'llama-3.3-70b-versatile'),
+            defaults={
+                'endpoint_url': os.getenv('GROQ_BASE_URL', 'https://api.groq.com/openai/v1'),
+                'is_default': True,
+                'config': {'temperature': 0.0, 'max_tokens': 768},
+            },
+        )
         AIModelConfig.objects.update_or_create(
             tenant=None,
             purpose='generation',
@@ -106,7 +120,7 @@ class Command(BaseCommand):
             model_name='Qwen/Qwen3-8B',
             defaults={
                 'endpoint_url': os.getenv('VLLM_BASE_URL', 'http://vllm:8000/v1'),
-                'is_default': True,
+                'is_default': False,
                 'config': {'temperature': 0.0, 'max_tokens': 768},
             },
         )
@@ -142,11 +156,19 @@ class Command(BaseCommand):
                     'tenant': tenant,
                     'is_tenant_admin': is_admin,
                     'is_active': True,
+                    'is_email_verified': True,
                 },
             )
             user.roles.set([role])
             user.set_password('password123')
             user.save()
+            # Membership is the source of truth for workspace access.
+            membership, _ = Membership.objects.update_or_create(
+                user=user,
+                tenant=tenant,
+                defaults={'role': 'owner' if is_admin else 'member', 'status': 'active'},
+            )
+            membership.roles.set([role])
 
         # 4. API Keys
         # For demo purposes, enforce exact tokens documented in README.

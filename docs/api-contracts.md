@@ -4,6 +4,23 @@
 - Local demo login: `POST /api/auth/login/` returns a SimpleJWT access token.
 - Production login: Keycloak OIDC access tokens are accepted when `KEYCLOAK_JWKS_URL` and `KEYCLOAK_AUDIENCE` are configured.
 - RAG API accepts either API keys beginning with `sk_` or user JWTs. It calls Core API verification endpoints before chat, ingestion, logs, and citation file access.
+- Public `/v1` integrations should use scoped API keys from trusted server-side code. Do not expose full-scope keys in browser-only or mobile clients.
+
+## Self-Serve Signup
+`POST /api/signup/` provisions a tenant, admin user, default roles, trial subscription, entitlements, and first integration API key.
+
+```json
+{
+  "organization_name": "Acme Apps",
+  "workspace_slug": "acme-apps",
+  "admin_username": "acme-admin",
+  "admin_email": "admin@acme.example",
+  "admin_password": "super-secret-123",
+  "plan_code": "developer-starter"
+}
+```
+
+The response includes `tenant`, `user`, `subscription`, `api_key.raw_key`, and a tenant admin `access_token`.
 
 ## Tenant-Scoped Core APIs
 All tenant data endpoints require authentication and automatically scope non-superusers to `request.user.tenant_id`.
@@ -20,6 +37,9 @@ All tenant data endpoints require authentication and automatically scope non-sup
 - `GET /api/ingestion-run-logs/`
 - `GET /api/usage/summary/`
 - `GET /api/billing/summary/`
+- `GET /api/integration/quickstart/`
+- `GET /api/integration-jobs/`
+- `GET /api/rag-traces/`
 
 Unsafe methods require tenant admin unless the view is a content operation. Source, schedule, document, and prompt operations may also be performed by Faculty/Staff roles.
 
@@ -79,6 +99,45 @@ Body:
 ```
 
 ## RAG APIs
+Public stable endpoints:
+
+`POST /v1/query`
+
+```json
+{
+  "query": "What does our refund policy say?"
+}
+```
+
+`POST /v1/query/stream` uses the same request body and returns SSE frames.
+
+`POST /v1/sources`
+
+```json
+{
+  "title": "Help Center",
+  "url": "https://example.com/help",
+  "roles": ["Member"]
+}
+```
+
+`POST /v1/documents`
+
+```json
+{
+  "title": "Internal Policy",
+  "content": "Policy text...",
+  "roles": ["Member"],
+  "source_uri": "crm://article/123"
+}
+```
+
+`GET /v1/jobs/{id}` returns Celery job state.
+
+`GET /v1/usage` returns subscription, entitlements, usage, scopes, and API-key prefix.
+
+Backward-compatible internal endpoints:
+
 `POST /chat`
 
 ```json
