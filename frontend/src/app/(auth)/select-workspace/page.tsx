@@ -33,8 +33,11 @@ export default function SelectWorkspacePage() {
     try {
       const res = await fetch(`${CORE_API}/api/auth/workspace/`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ identity_token: identityToken, workspace_slug: ws.slug }),
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${identityToken}`,
+        },
+        body: JSON.stringify({ workspace_slug: ws.slug }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Workspace login failed.');
@@ -52,7 +55,7 @@ export default function SelectWorkspacePage() {
 
   return (
     <div className="auth-card">
-      <div className="auth-logo">R</div>
+      <div className="auth-logo">L</div>
       <h1 className="auth-title">Choose a workspace</h1>
       <p className="auth-sub">Select the workspace you want to sign in to.</p>
 

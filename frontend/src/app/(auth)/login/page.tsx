@@ -76,8 +76,11 @@ export default function LoginPage() {
   const selectWorkspace = async (identityToken: string, workspace: Workspace) => {
     const res = await fetch(`${CORE_API}/api/auth/workspace/`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ identity_token: identityToken, workspace_slug: workspace.slug }),
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${identityToken}`,
+      },
+      body: JSON.stringify({ workspace_slug: workspace.slug }),
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'Workspace login failed.');
@@ -120,9 +123,9 @@ export default function LoginPage() {
 
   return (
     <div className="auth-card">
-      <div className="auth-logo">R</div>
-      <h1 className="auth-title">Welcome back</h1>
-      <p className="auth-sub">Sign in to your RAG SaaS workspace.</p>
+      <div className="auth-logo">L</div>
+      <h1 className="auth-title">Welcome to Lumora</h1>
+      <p className="auth-sub">Sign in to your knowledge workspace.</p>
 
       {/* ── Demo accounts ─────────────────────────────────────── */}
       <div className="demo-section">
@@ -192,7 +195,7 @@ export default function LoginPage() {
       <hr className="auth-divider" />
 
       <p className="text-center text-sm text-slate-500">
-        New to RAG SaaS?{' '}
+        New to Lumora?{' '}
         <Link href="/signup" className="auth-link">Create an account</Link>
       </p>
     </div>
