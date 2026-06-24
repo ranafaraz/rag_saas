@@ -239,10 +239,14 @@ def _verify_email_token(token: str):
 
 
 def _membership_payload(membership) -> dict:
+    slug = membership.tenant.slug or ''
+    name = membership.tenant.name
     return {
         'tenant_id': str(membership.tenant_id),
-        'tenant_name': membership.tenant.name,
-        'tenant_slug': membership.tenant.slug or '',
+        'tenant_name': name,
+        'tenant_slug': slug,
+        'slug': slug,   # frontend Workspace.slug
+        'name': name,   # frontend Workspace.name
         'role': membership.role,
         'is_admin': membership.is_admin,
         'roles': list(membership.roles.values_list('name', flat=True)),

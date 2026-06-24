@@ -103,6 +103,10 @@ class KeycloakJWTAuthentication(BaseAuthentication):
                 options={"verify_iss": bool(issuer)},
             )
         except Exception as exc:
+            msg = str(exc)
+            # Network error reaching JWKS endpoint → Keycloak not running; let SimpleJWT try.
+            if "fetch" in msg.lower() or "connection" in msg.lower() or "resolve" in msg.lower() or "errno" in msg.lower():
+                return None
             raise AuthenticationFailed(f"Invalid Keycloak token: {exc}")
 
         email = payload.get("email") or payload.get("preferred_username")

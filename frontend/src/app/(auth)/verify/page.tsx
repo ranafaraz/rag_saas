@@ -1,11 +1,11 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { Suspense, useEffect, useState } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { CORE_API } from '@/lib/api';
 
-export default function VerifyPage() {
+function VerifyContent() {
   const searchParams = useSearchParams();
   const router = useRouter();
   const token = searchParams.get('token');
@@ -65,5 +65,19 @@ export default function VerifyPage() {
         </>
       )}
     </div>
+  );
+}
+
+export default function VerifyPage() {
+  return (
+    <Suspense fallback={
+      <div className="auth-card text-center">
+        <div className="auth-logo" style={{ margin: '0 auto 20px' }}>⟳</div>
+        <h1 className="auth-title">Email verification</h1>
+        <p className="auth-sub mt-3">Verifying your email address…</p>
+      </div>
+    }>
+      <VerifyContent />
+    </Suspense>
   );
 }
