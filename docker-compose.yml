@@ -57,6 +57,7 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    restart: unless-stopped
 
   mongodb:
     image: mongo:6
@@ -72,6 +73,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
+    restart: unless-stopped
 
   redis:
     image: redis:7-alpine
@@ -84,6 +86,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+    restart: unless-stopped
 
   qdrant:
     image: qdrant/qdrant:latest
@@ -96,6 +99,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
+    restart: unless-stopped
 
   ollama:
     image: ollama/ollama:latest
@@ -104,6 +108,7 @@ services:
     volumes:
       - ollama_data:/root/.ollama
     # CPU-only: no GPU deploy section. Add gpus: all later for GPU upgrade.
+    restart: unless-stopped
 
   # ─── Application Services ────────────────────────────────────────────────────
   core_api:
@@ -119,7 +124,7 @@ services:
         condition: service_healthy
     volumes:
       - ./core_backend:/app
-    restart: on-failure
+    restart: unless-stopped
 
   rag_api:
     build:
@@ -137,7 +142,7 @@ services:
     volumes:
       - ./rag_backend:/app
       - upload_data:/tmp/uploads
-    restart: on-failure
+    restart: unless-stopped
 
   celery_worker:
     build:
@@ -154,7 +159,7 @@ services:
     volumes:
       - ./rag_backend:/app
       - upload_data:/tmp/uploads
-    restart: on-failure
+    restart: unless-stopped
 
   celery_beat:
     build:
@@ -168,7 +173,7 @@ services:
         condition: service_healthy
     volumes:
       - ./rag_backend:/app
-    restart: on-failure
+    restart: unless-stopped
 
   frontend:
     build:
@@ -182,7 +187,7 @@ services:
     depends_on:
       - core_api
       - rag_api
-    restart: on-failure
+    restart: unless-stopped
 
 volumes:
   postgres_data:
